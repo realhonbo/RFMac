@@ -1,0 +1,204 @@
+#!/opt/homebrew/bin/python3
+# coding=utf-8
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import subprocess
+import threading
+import os, sys, stat, pty, re
+
+class CommandRunner:
+    def __init__(self, log_callback):
+        self.log_callback = log_callback
+        self.tool_path = self._find_tool()
+
+
+    def _find_tool(self):
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+
+        tool_name = 'upgrade_tool'
+        tool_full_path = os.path.join(base_path, tool_name)
+
+        if not os.path.exists(tool_full_path):
+            self.log_callback(f'[Error] {tool_name} not found')
+            return None
+
+        try:
+            st = os.stat(tool_full_path)
+            os.chmod(tool_full_path, st.st_mode | stat.S_IEXEC)
+        except Exception as e:
+            self.log_callback(f'[Warn] Failed to set executable {e}')
+
+        self.log_callback(f'[INFO] found tool path: {tool_full_path}')
+        return tool_full_path
+
+
+    def run(self, args, on_finish=None):
+            if not self.tool_path:
+                self.log_callback('[Error] upgrade_tool not found')
+                return
+
+            def task():
+                tool_name = os.path.basename(self.tool_path)
+                self.log_callback(f'\n$ {' '.join([tool_name] + args)}')
+
+                master_fd, slave_fd = pty.openpty()
+                try:
+                    process = subprocess.Popen(
+                        [self.tool_path] + args,
+                        stdout = slave_fd,
+                        stderr = slave_fd,
+                        stdin  = slave_fd,
+                        text   = True,
+                        bufsize= 0
+                    )
+                    os.close(slave_fd)
+
+                    while True:
+                        try:
+                            output = os.read(master_fd, 1024)
+                            if not output:
+                                break
+                            text = output.decode('utf-8', errors='replace')
+                            self.log_callback(text.strip())
+                        except OSError:
+                            break
+                    process.wait()
+                    if process.returncode:
+                        self.log_callback(f'(ErrorCode: {process.returncode})')
+
+                except Exception as e:
+                    self.log_callback(f'[Error] Failed to run: {str(e)}')
+                finally:
+                    if 'master_fd' in locals():
+                        try: os.close(master_fd)
+                        except: pass
+
+                if on_finish:
+                    on_finish()
+            threading.Thread(target=task, daemon=True).start()
+
+
+
+class RockchipGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title('RFM: Rockchip Flasher For Mac')
+        self.root.geometry('650x550')
+        self.target_file_path = tk.StringVar()
+        self._setup_styles()
+        self._setup_log_area()
+        self.runner = CommandRunner(self.log)
+        self._setup_file_selection()
+        self._setup_action_buttons()
+
+
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Action.TButton', padding=5, width=15)
+        style.configure('File.TButton', width=8)
+
+
+    def _setup_file_selection(self):
+        frame = ttk.LabelFrame(self.root, text='File Selection', padding=10)
+        frame.pack(fill='x', padx=10, pady=5)
+        row = ttk.Frame(frame)
+        row.pack(fill='x', pady=2)
+        ttk.Label(row, text='镜像文件:', width=15, anchor='e').pack(side='left', padx=5)
+        ttk.Entry(row, textvariable=self.target_file_path).pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(row, text='Browse', style='File.TButton',
+                   command=lambda: self._browse_file(self.target_file_path)).pack(side='left')
+
+
+    def _setup_action_buttons(self):
+        frame = ttk.LabelFrame(self.root, text='Dashboard', padding=10)
+        frame.pack(fill='x', padx=10, pady=5)
+
+        actions = [
+            ('检测设备 (LD)', lambda: self.runner.run(['LD'])),
+            ('复位设备 (RD)', lambda: self.runner.run(['RD'])),
+            ('查看分区 (PL)', lambda: self.runner.run(['PL'])),
+
+            ('烧写固件 (UF)',   self._cmd_upgrade_firmware),
+            ('下载 Loader (DB)',self._cmd_download_boot),
+            ('擦除 Flash (EF)', self._cmd_erase_flash),
+        ]
+
+        cols = 3
+        for i, (text, func) in enumerate(actions):
+            btn = ttk.Button(frame, text=text, command=func, style='Action.TButton')
+            btn.grid(row=i//cols, column=i%cols, padx=5, pady=5, sticky='ew')
+        for i in range(cols):
+            frame.columnconfigure(i, weight=1)
+
+
+    def _setup_log_area(self):
+        frame = ttk.Frame(self.root)
+        frame.pack(fill='both', expand=True, padx=10, pady=10)
+        lbl = ttk.Label(frame, text='System Log')
+        lbl.pack(anchor='w')
+        self.log_text = scrolledtext.ScrolledText(frame, height=10, bg='#2b2b2b', fg='#00dd00',
+                                                  font=('Menlo', 10), state='disabled')
+        self.log_text.pack(fill='both', expand=True)
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label='清空日志', command=self._clear_log)
+        self.log_text.bind('<Button-3>', lambda e: self.context_menu.post(e.x_root, e.y_root))
+
+
+    def _browse_file(self, var):
+        f = filedialog.askopenfilename(filetypes=[('Image Files', '*.img *.bin'), ('All Files', '*.*')])
+        if f: var.set(f)
+
+
+    def log(self, msg):
+        # Remove all ANSI control code
+        ANSI_ESCAPE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+        clean_msg = ANSI_ESCAPE.sub('', msg)
+        clean_msg = clean_msg.replace('\r', '')
+        if not clean_msg.strip():
+            return
+        def _write():
+            self.log_text.config(state='normal')
+            self.log_text.insert(tk.END, clean_msg + '\n')
+            self.log_text.see(tk.END)
+            self.log_text.config(state='disabled')
+        self.root.after(0, _write)
+
+
+    def _clear_log(self):
+        self.log_text.config(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state='disabled')
+
+
+    def _get_current_file(self):
+        path = self.target_file_path.get()
+        if not path:
+            self.log('[Warn] Please choose a image file')
+            return None
+        return path
+
+
+    def _cmd_upgrade_firmware(self):
+        path = self._get_current_file()
+        if path: self.runner.run(['UF', path])
+
+
+    def _cmd_download_boot(self):
+        path = self._get_current_file()
+        if path: self.runner.run(['DB', path])
+
+
+    def _cmd_erase_flash(self):
+        if messagebox.askyesno('Warn', '抹掉整个 Flash'):
+            self.runner.run(['EF', path])
+
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = RockchipGUI(root)
+    root.mainloop()
